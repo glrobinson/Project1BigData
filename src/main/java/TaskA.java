@@ -13,7 +13,7 @@ public class TaskA {
     public static class TokenizerMapper
             extends Mapper<Object, Text, Text, Text> {
 
-        private final static String Nationality = "Sweden";
+        private final static String Nationality = "Dominica";
 
         public void map(Object key, Text value, Context context
         ) throws IOException, InterruptedException {
@@ -28,6 +28,7 @@ public class TaskA {
     }
 
     public static void main(String[] args) throws Exception {
+        long timeNow = System.currentTimeMillis();
         Configuration conf = new Configuration();
         Job job = Job.getInstance(conf, "nationality");
         job.setJarByClass(TaskA.class);
@@ -36,6 +37,9 @@ public class TaskA {
         job.setOutputValueClass(Text.class);
         FileInputFormat.addInputPath(job, new Path("/Users/gracerobinson/Project1_BigData/Project1/input/pages.csv"));
         FileOutputFormat.setOutputPath(job, new Path("/Users/gracerobinson/Project1_BigData/Project1/output/outputA"));
-        System.exit(job.waitForCompletion(true) ? 0 : 1);
+        job.waitForCompletion(true);
+        long timeFinish = System.currentTimeMillis();
+        double seconds = (timeFinish - timeNow) /1000.0;
+        System.out.println(seconds + "  seconds");
     }
 }

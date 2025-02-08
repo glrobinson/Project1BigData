@@ -10,7 +10,7 @@ import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
 
 import java.io.IOException;
 
-public class TaskC {
+public class TaskC_Optimized {
     public static class TokenizerMapper
             extends Mapper<Object, Text, Text, IntWritable> {
 
@@ -49,13 +49,15 @@ public class TaskC {
         long timeNow = System.currentTimeMillis();
         Configuration conf = new Configuration();
         Job job = Job.getInstance(conf, "nationality");
-        job.setJarByClass(TaskC.class);
-        job.setMapperClass(TaskC.TokenizerMapper.class);
-        job.setReducerClass(TaskC.IntSumReducer.class);
+        job.setJarByClass(TaskC_Optimized.class);
+        job.setMapperClass(TaskC_Optimized.TokenizerMapper.class);
+        // add combiner
+        job.setCombinerClass(IntSumReducer.class);
+        job.setReducerClass(TaskC_Optimized.IntSumReducer.class);
         job.setOutputKeyClass(Text.class);
         job.setOutputValueClass(IntWritable.class);
         FileInputFormat.addInputPath(job, new Path("/Users/gracerobinson/Project1_BigData/Project1/input/pages.csv"));
-        FileOutputFormat.setOutputPath(job, new Path("/Users/gracerobinson/Project1_BigData/Project1/output/outputC"));
+        FileOutputFormat.setOutputPath(job, new Path("/Users/gracerobinson/Project1_BigData/Project1/output/outputC_Optimized"));
         job.waitForCompletion(true);
         long timeFinish = System.currentTimeMillis();
         double seconds = (timeFinish - timeNow) /1000.0;

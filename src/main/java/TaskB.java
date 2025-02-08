@@ -1,201 +1,151 @@
+import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.io.IntWritable;
-import org.apache.hadoop.io.Text;
-import org.apache.hadoop.mapreduce.Job;
-import org.apache.hadoop.mapreduce.Mapper;
-import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.io.*;
+import org.apache.hadoop.mapreduce.*;
 import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
-import org.apache.hadoop.mapreduce.lib.input.MultipleInputs;
-import org.apache.hadoop.mapreduce.lib.input.TextInputFormat;
 import org.apache.hadoop.mapreduce.lib.output.FileOutputFormat;
+import org.apache.hadoop.io.IOUtils;
 
-import java.io.IOException;
-import java.util.AbstractMap;
-import java.util.Comparator;
-import java.util.Map;
+import java.io.*;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.PriorityQueue;
 
 public class TaskB {
-    // this is the function to count page accesses
-        public static class TokenizerMapper
-                extends Mapper<Object, Text, IntWritable, IntWritable> {
 
-            private IntWritable pID = new IntWritable();
-            private final static IntWritable one = new IntWritable(1);
+    // Count Accesses
+    public static class TokenizerMapper extends Mapper<Object, Text, IntWritable, IntWritable> {
+        private final static IntWritable one = new IntWritable(1);
+        private IntWritable pID = new IntWritable();
 
-            public void map(Object key, Text value, Context context
-            ) throws IOException, InterruptedException {
-                String[] fields = value.toString().split(",");
-                if (fields.length < 4) {
-                    return;
-                }
+        public void map(Object key, Text value, Context context) throws IOException, InterruptedException {
+            String[] fields = value.toString().split(",");
+            if (fields.length < 4) return;
 
-                try {
-                    int p = Integer.parseInt(fields[2].trim());
-                    pID.set(p);
-                    context.write(pID, one);
-                } catch (NumberFormatException e) {}
-            }
-        }
-
-    public static class IntSumReducer
-            extends Reducer<IntWritable,IntWritable,IntWritable,IntWritable> {
-        private IntWritable result = new IntWritable();
-
-        public void reduce(IntWritable key, Iterable<IntWritable> values,
-                           Context context
-        ) throws IOException, InterruptedException {
-            int sum = 0;
-            for (IntWritable val : values) {
-                sum += val.get();
-            }
-            result.set(sum);
-            context.write(key, result);
+            try {
+                int p = Integer.parseInt(fields[2].trim());
+                pID.set(p);
+                context.write(pID, one);
+            } catch (NumberFormatException ignored) {}
         }
     }
 
-    public static class TokenizerMapper2 extends Mapper<Object, Text, IntWritable, IntWritable> {
-            private IntWritable pID = new IntWritable();
-            private IntWritable count = new IntWritable();
+    // Extract Top 10 Pages
+    public static class PartB_Reducer extends Reducer<IntWritable, IntWritable, IntWritable, IntWritable> {
+        public static class PageRankByCount implements Comparable<PageRankByCount> {
+            public int pageId, accesses;
 
-            public void map(Object key, Text value, Context context)
-                throws IOException, InterruptedException {
-                String[] fields = value.toString().split("\t");
-                if (fields.length < 2) {
-                    return;
-                }
-                pID.set(Integer.parseInt(fields[0]));
-                count.set(Integer.parseInt(fields[1]));
-                context.write(pID, count);
+            public PageRankByCount(int pageId, int accesses) {
+                this.pageId = pageId;
+                this.accesses = accesses;
             }
-    }
 
-    // this is the function that extracts the top 10 pages
-    public static class IntSumReducer2
-            extends Reducer<IntWritable,IntWritable,IntWritable,IntWritable> {
-        private PriorityQueue<Map.Entry<Integer, Integer>> top = new PriorityQueue<>(
-                10, Comparator.comparingInt(Map.Entry::getValue)
-        );
+            @Override
+            public int compareTo(PageRankByCount obj2) {
+                return Integer.compare(this.accesses, obj2.accesses);
+            }
+        }
 
-        public void reduce(IntWritable key, Iterable<IntWritable> values,
-                           Context context
-        ) throws IOException, InterruptedException {
+        private PriorityQueue<PageRankByCount> topTen = new PriorityQueue<>();
+        private IntWritable outKey = new IntWritable();
+        private IntWritable outValue = new IntWritable();
+
+        public void reduce(IntWritable key, Iterable<IntWritable> values, Context context) throws IOException, InterruptedException {
             int sum = 0;
-            for (IntWritable val : values) {
-                sum += val.get();
-            }
-            top.add(new AbstractMap.SimpleEntry<>(key.get(), sum));
-            if (top.size() > 10) {
-                top.poll();
-            }
+            for (IntWritable val : values) sum += val.get();
+
+            topTen.add(new PageRankByCount(key.get(), sum));
+            if (topTen.size() > 10) topTen.poll();
         }
 
         @Override
         protected void cleanup(Context context) throws IOException, InterruptedException {
-            while (!top.isEmpty()) {
-                Map.Entry<Integer, Integer> entry = top.poll();
-                context.write(new IntWritable(entry.getKey()), new IntWritable(entry.getValue()));
+            for (PageRankByCount page : topTen) {
+                outKey.set(page.pageId);
+                outValue.set(page.accesses);
+                context.write(outKey, outValue);
             }
         }
     }
 
-    public static class TokenizerMapper3 extends Mapper<Object, Text, IntWritable, Text> {
-        private IntWritable pID = new IntWritable();
-        private Text info = new Text();
+    // Mapper-Side Join using Distributed Cache
+    public static class ReplicatedJoinMapper extends Mapper<LongWritable, Text, Text, NullWritable> {
+        private HashMap<String, String> pagesData = new HashMap<>();
+        private Text outputText = new Text();
 
-        public void map(Object key, Text value, Context context)
-                throws IOException, InterruptedException {
-            String[] fields = value.toString().split(",");
-            if (fields.length < 5) {
-                return;
+        @Override
+        protected void setup(Context context) throws IOException, InterruptedException {
+            URI[] cacheFiles = context.getCacheFiles();
+            if (cacheFiles == null || cacheFiles.length == 0) {
+                throw new RuntimeException("Pages file is not set in Distributed Cache");
             }
-            try {
-                pID.set(Integer.parseInt(fields[0]));
-                info.set(fields[1] + "," + fields[2]);
-                context.write(pID, info);
-            } catch (NumberFormatException e) {}
-        }
-    }
 
-    public static class TokenizerMapper4 extends Mapper<Object, Text, IntWritable, Text> {
-        private IntWritable pID = new IntWritable();
-        private Text count = new Text();
+            Path path = new Path(cacheFiles[0]);
+            FileSystem fs = FileSystem.get(context.getConfiguration());
+            FSDataInputStream fis = fs.open(path);
+            BufferedReader reader = new BufferedReader(new InputStreamReader(fis, StandardCharsets.UTF_8));
 
-        public void map(Object key, Text value, Context context)
-                throws IOException, InterruptedException {
-            String[] fields = value.toString().split("\t");
-            if (fields.length < 2) {
-                return;
-            }
-            pID.set(Integer.parseInt(fields[0]));
-            count.set(fields[1]);
-            context.write(pID, count);
-        }
-    }
-
-    public static class IntSumReducer3
-            extends Reducer<IntWritable,Text,IntWritable,Text> {
-        private String info = null;
-        private String count = null;
-
-        public void reduce(IntWritable key, Iterable<Text> values,
-                           Context context
-        ) throws IOException, InterruptedException {
-            info = null;
-            count = null;
-            for (Text val : values) {
-                String fields = val.toString();
-                if (fields.contains(",")) {
-                    info = fields;
-                } else {
-                    count = fields;
+            String line;
+            while (StringUtils.isNotEmpty(line = reader.readLine())) {
+                String[] fields = line.split(",");
+                if (fields.length >= 3) {
+                    pagesData.put(fields[0], fields[1] + "," + fields[2]);  // Store PageID -> "PageName, Nationality"
                 }
             }
-            if (info != null && count != null) {
-                context.write(key, new Text(info));
+            IOUtils.closeStream(reader);
+        }
+
+        @Override
+        protected void map(LongWritable key, Text value, Context context) throws IOException, InterruptedException {
+            String[] fields = value.toString().split("\t");
+            if (fields.length < 2) return;
+
+            String pageID = fields[0];
+            String accessCount = fields[1];
+
+            if (pagesData.containsKey(pageID)) {
+                outputText.set(pageID + "\t" + pagesData.get(pageID));
+                context.write(outputText, NullWritable.get());
             }
         }
     }
 
-
     public static void main(String[] args) throws Exception {
+        long timeNow = System.currentTimeMillis();
         Configuration conf = new Configuration();
         FileSystem fs = FileSystem.get(conf);
 
-        Job job = Job.getInstance(conf, "count access");
-        job.setJarByClass(TaskB.class);
-        job.setMapperClass(TokenizerMapper.class);
-        job.setCombinerClass(IntSumReducer.class);
-        job.setReducerClass(IntSumReducer.class);
-        job.setOutputKeyClass(IntWritable.class);
-        job.setOutputValueClass(IntWritable.class);
-        FileInputFormat.addInputPath(job, new Path("/Users/gracerobinson/Project1_BigData/Project1/input/access_logs.csv"));
-        FileOutputFormat.setOutputPath(job, new Path("/Users/gracerobinson/Project1_BigData/Project1/output/outputBCount"));
-        job.waitForCompletion(true);
+        // Count Accesses and Find Top 10
+        Job job1 = Job.getInstance(conf, "Count Page Accesses");
+        job1.setJarByClass(TaskB.class);
+        job1.setMapperClass(TokenizerMapper.class);
+        job1.setReducerClass(PartB_Reducer.class);
+        job1.setOutputKeyClass(IntWritable.class);
+        job1.setOutputValueClass(IntWritable.class);
+        FileInputFormat.addInputPath(job1, new Path("/Users/gracerobinson/Project1_BigData/Project1/input/access_logs.csv"));
+        Path outputPath1 = new Path("/Users/gracerobinson/Project1_BigData/Project1/output/outputBTop");
+        FileOutputFormat.setOutputPath(job1, outputPath1);
+        job1.waitForCompletion(true);
 
-
-        Job job2 = Job.getInstance(conf, "top 10 pages");
+        // Mapper-Side Join with Pages.csv
+        Job job2 = Job.getInstance(conf, "Join Top 10 Pages with Metadata");
         job2.setJarByClass(TaskB.class);
-        job2.setMapperClass(TokenizerMapper2.class);
-        job2.setReducerClass(IntSumReducer2.class);
-        job2.setOutputKeyClass(IntWritable.class);
-        job2.setOutputValueClass(IntWritable.class);
-        FileInputFormat.addInputPath(job2, new Path("/Users/gracerobinson/Project1_BigData/Project1/output/outputBCount"));
-        FileOutputFormat.setOutputPath(job2, new Path("/Users/gracerobinson/Project1_BigData/Project1/output/outputBTop"));
+        job2.setMapperClass(ReplicatedJoinMapper.class);
+        job2.setOutputKeyClass(Text.class);
+        job2.setOutputValueClass(NullWritable.class);
+        Path outputPath2 = new Path("/Users/gracerobinson/Project1_BigData/Project1/output/outputB");
+        FileOutputFormat.setOutputPath(job2, outputPath2);
+        // Set Pages.csv as Distributed Cache File
+        job2.addCacheFile(new URI("/Users/gracerobinson/Project1_BigData/Project1/input/pages.csv"));
+        FileInputFormat.addInputPath(job2, outputPath1);  // Read from Top 10 pages
         job2.waitForCompletion(true);
 
-        Job job3 = Job.getInstance(conf, "results");
-        job3.setJarByClass(TaskB.class);
-        MultipleInputs.addInputPath(job3, new Path("/Users/gracerobinson/Project1_BigData/Project1/output/outputBTop"),
-                TextInputFormat.class, TokenizerMapper4.class);
-        MultipleInputs.addInputPath(job3, new Path("/Users/gracerobinson/Project1_BigData/Project1/input/pages.csv"),
-                TextInputFormat.class, TokenizerMapper3.class);
-        job3.setReducerClass(IntSumReducer3.class);
-        job3.setOutputKeyClass(IntWritable.class);
-        job3.setOutputValueClass(Text.class);
-        FileOutputFormat.setOutputPath(job3, new Path("/Users/gracerobinson/Project1_BigData/Project1/output/outputB"));
-        System.exit(job3.waitForCompletion(true) ? 0 : 1);
+        long timeFinish = System.currentTimeMillis();
+        double seconds = (timeFinish - timeNow) /1000.0;
+        System.out.println(seconds + "  seconds");
     }
 }
